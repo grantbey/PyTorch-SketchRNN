@@ -1,5 +1,9 @@
 import numpy as np
 import torch
+from torch.autograd import Variable
+from sketch_rnn import hypers
+
+hyper = hypers()
 
 class sketchLoader():
     def __init__(self,datafile):
@@ -25,7 +29,7 @@ class sketchLoader():
         def normalize(self, strokes):
             """Normalize entire dataset (delta_x, delta_y) by the scaling factor."""
             data = []
-            scale_factor = calculate_normalizing_scale_factor(strokes)
+            scale_factor = calculate_normalizing_scale_factor(self,strokes)
             for seq in strokes:
                 seq[:, 0:2] /= scale_factor
                 data.append(seq)
@@ -36,9 +40,10 @@ class sketchLoader():
             return max(sizes)
 
         self.data = np.load(datafile, encoding = 'latin1')
-        self.data = purify(data)
-        self.data = normalize(data)
-        self.Nmax = max_size(data)
+        self.data = self.data['train']
+        self.data = purify(self,self.data)
+        self.data = normalize(self,self.data)
+        self.Nmax = max_size(self,self.data)
 
     def get_batch(self, batch_size):
         idxs = np.random.choice(len(self.data),batch_size)
@@ -67,12 +72,12 @@ class sketchLoader():
         batch = torch.cat([batch, eos], 0)
         mask = torch.zeros(self.Nmax + 1, batch.size()[1])
 
-        for id, length in enumerate(lengths)
+        for id, length in enumerate(lengths):
             mask[:length,id] = 1
-            mask = Variable(mask.cuda()).detach()
+        mask = Variable(mask.cuda()).detach()
 
-        dx = torch.stack([Variable(batch.data[:, :, 0])] * hp.M, 2).detach()
-        dy = torch.stack([Variable(batch.data[:, :, 1])] * hp.M, 2).detach()
+        dx = torch.stack([Variable(batch.data[:, :, 0])] * hyper.M, 2).detach()
+        dy = torch.stack([Variable(batch.data[:, :, 1])] * hyper.M, 2).detach()
         p1 = Variable(batch.data[:, :, 2]).detach()
         p2 = Variable(batch.data[:, :, 3]).detach()
         p3 = Variable(batch.data[:, :, 4]).detach()

@@ -98,74 +98,74 @@ class decoder(nn.Module):
         # Note that M is a hyperparameter.
         self.fc_y = nn.Linear(hyper.decoder_hidden_size, 6 * hyper.M + 3)
 
-        def forward(self, inputs, z, batch_size,hidden_cell=None):
-            if hidden_cell is None:
-                # Feed z into the linear layer, apply a tanh activation, then split along the second dimension
-                # Since the size is 2*params.decoder_hidden_size, splitting is by params.decoder_hidden_size divides it into two parts
-                hidden,cell = torch.split(F.tanh(self.hc(z)), hyper.decoder_hidden_size, 1)
-                # Now create a tuple, add in an extra dimension in the first position and ensure that it's contiguous in memory
-                hidden_cell = (hidden.unsqueeze(0).contiguous(),cell.unsqueeze(0).contiguous())
+    def forward(self, inputs, z, batch_size, hidden_cell=None):
+        if hidden_cell is None:
+            # Feed z into the linear layer, apply a tanh activation, then split along the second dimension
+            # Since the size is 2*params.decoder_hidden_size, splitting is by params.decoder_hidden_size divides it into two parts
+            hidden,cell = torch.split(F.tanh(self.hc(z)), hyper.decoder_hidden_size, 1)
+            # Now create a tuple, add in an extra dimension in the first position and ensure that it's contiguous in memory
+            hidden_cell = (hidden.unsqueeze(0).contiguous(),cell.unsqueeze(0).contiguous())
 
-            # Note input size is [132, 100, 133]
-            # This is [Nmax+1, batch, Nmax+1+1]
-            # Where the Nmax+1+1 accounts for the fake initial value AND the concatenated z vector
+        # Note input size is [132, 100, 133]
+        # This is [Nmax+1, batch, Nmax+1+1]
+        # Where the Nmax+1+1 accounts for the fake initial value AND the concatenated z vector
 
-            # Feed everything into the decoder LSTM
-            outputs,(hidden,cell) = self.lstm(inputs, hidden_cell)
-            # Note: the output size will be [seq_len, batch, hidden_size * num_directions]
-            # Thus, [132, batch, hyper.decoder_hidden_size] i.e. [132, 100, 512]
+        # Feed everything into the decoder LSTM
+        outputs,(hidden,cell) = self.lstm(inputs, hidden_cell)
+        # Note: the output size will be [seq_len, batch, hidden_size * num_directions]
+        # Thus, [132, batch, hyper.decoder_hidden_size] i.e. [132, 100, 512]
 
-            # There are two modes: training and generate
-            # While training, we feed the LSTM with the whole input and use all outputs
-            # In generate mode, we just feed the last generated sample
+        # There are two modes: training and generate
+        # While training, we feed the LSTM with the whole input and use all outputs
+        # In generate mode, we just feed the last generated sample
 
-            # Note: text implies that hidden state is used in training, whilst
-            if self.training:
-                # Note: view(-1,...) reshapes the output to a vector of length params.dec_hidden_size
-                # i.e. [132, 100, 512] -> [13200, 512]
-                y = self.fc_y(outputs.view(-1, hyper.decoder_hidden_size))
-            else:
-                y = self.fc_y(hidden.view(-1, hyper.decoder_hidden_size))
+        # Note: text implies that hidden state is used in training, whilst
+        if self.training:
+            # Note: view(-1,...) reshapes the output to a vector of length params.dec_hidden_size
+            # i.e. [132, 100, 512] -> [13200, 512]
+            y = self.fc_y(outputs.view(-1, hyper.decoder_hidden_size))
+        else:
+            y = self.fc_y(hidden.view(-1, hyper.decoder_hidden_size))
 
-            # Note y has size [batch*(Nmax+1),hyper.decoder_hidden_size] i.e [13200, 512]
-            # Split the output into groups of 6 parameters along the second axis
-            # Then stack all but the last one
-            # This creates params_mixture of size [M, (Nmax+1)*batch, 6], i.e. the 5 parameters of the bivariate normal distribution and the mixture weight
-            # for each of the Nmax lines in each of the batches
-            params = torch.split(y,6,1)
-            params_mixture = torch.stack(params[:-1])
+        # Note y has size [batch*(Nmax+1),hyper.decoder_hidden_size] i.e [13200, 512]
+        # Split the output into groups of 6 parameters along the second axis
+        # Then stack all but the last one
+        # This creates params_mixture of size [M, (Nmax+1)*batch, 6], i.e. the 5 parameters of the bivariate normal distribution and the mixture weight
+        # for each of the Nmax lines in each of the batches
+        params = torch.split(y,6,1)
+        params_mixture = torch.stack(params[:-1])
 
-            # Finally, the last three values are the parameters of the pen at this particular point
-            # This has a size [(Nmax+1)*batch, 3]
-            params_pen = params[-1]
+        # Finally, the last three values are the parameters of the pen at this particular point
+        # This has a size [(Nmax+1)*batch, 3]
+        params_pen = params[-1]
 
-            # Now split each parameter and label the variables appropriately
-            # Each will be of size [M, (Nmax+1)*batch, 1]
+        # Now split each parameter and label the variables appropriately
+        # Each will be of size [M, (Nmax+1)*batch, 1]
 
-            pi, mu_x, mu_y, sigma_x, sigma_y, rho_xy = torch.split(params_mixture, 1, 2)
+        pi, mu_x, mu_y, sigma_x, sigma_y, rho_xy = torch.split(params_mixture, 1, 2)
 
-            # Note: Nmax = 131
-            if self.training:
-                len_out = sketches.Nmax + 1
-            else:
-                len_out = 1
+        # Note: Nmax = 131
+        if self.training:
+            len_out = sketches.Nmax + 1
+        else:
+            len_out = 1
 
-            pi = F.softmax(pi.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
-            mu_x = mu_x.transpose(0,1).squeeze().contiguous().view(len_out,-1,hyper.M)
-            mu_y = mu_y.transpose(0,1).squeeze().contiguous().view(len_out,-1,hyper.M)
-            sigma_x = torch.exp(sigma_x.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
-            sigma_y = torch.exp(sigma_y.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
-            rho_xy = torch.tanh(rho_xy.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
-            q = F.softmax(params_pen).view(len_out,-1,3)
+        pi = F.softmax(pi.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
+        mu_x = mu_x.transpose(0,1).squeeze().contiguous().view(len_out,-1,hyper.M)
+        mu_y = mu_y.transpose(0,1).squeeze().contiguous().view(len_out,-1,hyper.M)
+        sigma_x = torch.exp(sigma_x.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
+        sigma_y = torch.exp(sigma_y.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
+        rho_xy = torch.tanh(rho_xy.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
+        q = F.softmax(params_pen).view(len_out,-1,3)
 
-            return pi, mu_x, mu_y, sigma_x, sigma_y, rho_xy, q, hidden, cell
+        return pi, mu_x, mu_y, sigma_x, sigma_y, rho_xy, q, hidden, cell
 
 class Model():
     def __init__(self):
         self.encoder = encoder().cuda()
         self.decoder = decoder().cuda()
         self.encoder_optim = optim.Adam(self.encoder.parameters(),hyper.lr)
-        self.decoder_optim = optim.Adam(self.decoder.paramters(),hyper.lr)
+        self.decoder_optim = optim.Adam(self.decoder.parameters(),hyper.lr)
         self.eta_step = hyper.eta_min
 
     def train(self, epoch):
@@ -181,7 +181,7 @@ class Model():
         z_stack = torch.stack([z] * (sketches.Nmax + 1))
         inputs = torch.cat([batch_init, z_stack], 2)
 
-        self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, self.rho_xy, self.q, _, _ = self.decoder(inputs, z)
+        self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, self.rho_xy, self.q, _, _ = self.decoder(inputs, z, hyper.batch_size)
 
         mask, dx, dy, p = sketches.get_target(batch,lengths)
 
@@ -249,5 +249,11 @@ class Model():
         KL_min = Variable(torch.Tensor([hyper.KL_min]).cuda()).detach()
         return hyper.wKL * self.eta_step * torch.max(LKL, KL_min)
 
-
-sketches = sketchLoader()
+if __name__=="__main__":
+    sketches = sketchLoader('octopus.npz')
+    model = Model()
+    train = True
+    if train:
+        # todo tqdm wrapper around train loop
+        for epoch in range(20001):
+            model.train(epoch)
