@@ -3,6 +3,7 @@ from torch import nn
 from torch.autograd import Variable
 from torch import optim
 import torch.nn.functional as F
+from custom_dataloader import *
 
 class hypers():
     def __init__(self):
@@ -11,6 +12,16 @@ class hypers():
         self.Nz = 128
         self.dropout = 0.9
         self.M = 20
+        self.max_seq_length = 200
+        self.lr = 0.001
+        self.eta_min = 0.01
+        self.data = 'octopus.npz'
+        self.batch_size = 100
+        self.R = 0.99995
+        self.KL_min = 0.2
+        self.wKL = 0.5
+        self.lr_decay = 0.9999
+        self.min_lr = 0.00001
 
 hyper = hypers()
 
@@ -129,3 +140,98 @@ class decoder(nn.Module):
             pi, mu_x, mu_y, sigma_x, sigma_y, rho_xy = torch.split(params_mixture, 1, 2)
 
             # Note: Nmax = 131
+            if self.training:
+                len_out = Nmax + 1
+            else:
+                len_out = 1
+
+            pi = F.softmax(pi.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
+            mu_x = mu_x.transpose(0,1).squeeze().contiguous().view(len_out,-1,hyper.M)
+            mu_y = mu_y.transpose(0,1).squeeze().contiguous().view(len_out,-1,hyper.M)
+            sigma_x = torch.exp(sigma_x.transpose(0,1).squeeze()).view(len_out,-1,yper.M)
+            sigma_y = torch.exp(sigma_y.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
+            rho_xy = torch.tanh(rho_xy.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
+            q = F.softmax(params_pen).view(len_out,-1,3)
+
+            return pi, mu_x, mu_y, sigma_x, sigma_y, rho_xy, q
+
+class Model():
+    def __init__(self):
+        self.encoder = encoder().cuda()
+        self.decoder = decoder().cuda()
+        self.encoder_optim = optim.Adam(self.encoder.parameters(),hyper.lr)
+        self.decoder_optim = optim.Adam(self.decoder.paramters(),hyper.lr)
+        self.eta_step = hyper.eta_min
+
+    def train(self, epoch):
+        self.encoder.train()
+        self.decoder.train()
+
+        batch, lengths = sketches.get_batch(hyper.batch_size)
+
+        z, self.mu, self.sigma = self.encoder(batch, hyper.batch_size)
+
+        sos = Variable(torch.stack([torch.Tensor([0, 0, 1, 0, 0])] * hp.batch_size).cuda()).unsqueeze(0)
+        batch_init = torch.cat([sos, batch], 0)
+        z_stack = torch.stack([z] * (sketches.Nmax + 1))
+        inputs = torch.cat([batch_init, z_stack], 2)
+
+        self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, self.rho_xy, self.q = self.decoder(inputs, z)
+
+        mask, dx, dy, p = sketches.get_target(batch,lengths)
+
+        self.encoder_optim.zero_grad()
+        self.decoder_optim.zero_grad()
+
+        self.eta_step = 1 - (1 - hp.eta_min) * hp.R
+
+        LKL = self.kullback_leibler_loss()
+        LR = self.reconstruction_loss(mask, dx, dy, p, epoch)
+        loss = LR + LKL
+
+        loss.backward()
+
+        nn.utils.clip_grad_norm(self.encoder.parameters(), hp.grad_clip)
+        nn.utils.clip_grad_norm(self.decoder.parameters(), hp.grad_clip)
+
+        self.encoder_optim.step()
+        self.decoder_optim.step()
+
+        if epoch%1000 == 0:
+            self.encoder_optim = lr_decay(self.encoder_optim)
+            self.decoder_optim = lr_decay(self.decoder_optim)
+
+        # todo save
+        # todo load
+        # todo conditional generation
+
+
+    def lr_decay(self, optimizer):
+        """Decay learning rate by a factor of lr_decay"""
+        for param_group in optimizer.param_groups:
+            if param_group['lr'] > hyper.min_lr:
+                param_group['lr'] *= hyper.lr_decay
+        return optimizer
+
+    def bivariate_normal_pdf(self, dx, dy):
+        z_x = ((dx - self.mu_x) / self.sigma_x) ** 2
+        z_y = ((dy - self.mu_y) / self.sigma_y) ** 2
+        z_xy = (dx - self.mu_x) * (dy - self.mu_y) / (self.sigma_x * self.sigma_y)
+        z = z_x + z_y - 2 * self.rho_xy * z_xy
+        exp = torch.exp(-z / (2 * (1 - self.rho_xy ** 2)))
+        norm = 2 * np.pi * self.sigma_x * self.sigma_y * torch.sqrt(1 - self.rho_xy ** 2)
+        return exp / norm
+
+    def reconstruction_loss(self, mask, dx, dy, p, epoch):
+        pdf = self.bivariate_normal_pdf(dx, dy)
+        LS = -torch.sum(mask * torch.log(1e-5 + torch.sum(self.pi * pdf, 2))) / float(sketches.Nmax * hp.batch_size)
+        LP = -torch.sum(p * torch.log(self.q)) / float(sketches.Nmax * hp.batch_size)
+        return LS + LP
+
+    def kullback_leibler_loss(self):
+        LKL = -0.5 * torch.sum(1 + self.sigma - self.mu ** 2 - torch.exp(self.sigma))/ float(hp.Nz * hp.batch_size)
+        KL_min = Variable(torch.Tensor([hyper.KL_min]).cuda()).detach()
+        return hyper.wKL * self.eta_step * torch.max(LKL, KL_min)
+
+
+sketches = sketchLoader()
