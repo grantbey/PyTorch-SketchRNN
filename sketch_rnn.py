@@ -1,9 +1,12 @@
-import torch
+# import torch
 from torch import nn
 from torch.autograd import Variable
 from torch import optim
 import torch.nn.functional as F
 from custom_dataloader import *
+
+# todo data augmentation: see supplementary section 3
+# todo encoder = 512, decoder = 2048
 
 class hypers():
     def __init__(self):
@@ -22,6 +25,7 @@ class hypers():
         self.wKL = 0.5
         self.lr_decay = 0.9999
         self.min_lr = 0.00001
+        self.grad_clip = 1.
 
 hyper = hypers()
 
@@ -115,6 +119,7 @@ class decoder(nn.Module):
             # While training, we feed the LSTM with the whole input and use all outputs
             # In generate mode, we just feed the last generated sample
 
+            # Note: text implies that hidden state is used in training, whilst
             if self.training:
                 # Note: view(-1,...) reshapes the output to a vector of length params.dec_hidden_size
                 # i.e. [132, 100, 512] -> [13200, 512]
@@ -141,19 +146,19 @@ class decoder(nn.Module):
 
             # Note: Nmax = 131
             if self.training:
-                len_out = Nmax + 1
+                len_out = sketches.Nmax + 1
             else:
                 len_out = 1
 
             pi = F.softmax(pi.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
             mu_x = mu_x.transpose(0,1).squeeze().contiguous().view(len_out,-1,hyper.M)
             mu_y = mu_y.transpose(0,1).squeeze().contiguous().view(len_out,-1,hyper.M)
-            sigma_x = torch.exp(sigma_x.transpose(0,1).squeeze()).view(len_out,-1,yper.M)
+            sigma_x = torch.exp(sigma_x.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
             sigma_y = torch.exp(sigma_y.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
             rho_xy = torch.tanh(rho_xy.transpose(0,1).squeeze()).view(len_out,-1,hyper.M)
             q = F.softmax(params_pen).view(len_out,-1,3)
 
-            return pi, mu_x, mu_y, sigma_x, sigma_y, rho_xy, q
+            return pi, mu_x, mu_y, sigma_x, sigma_y, rho_xy, q, hidden, cell
 
 class Model():
     def __init__(self):
@@ -171,19 +176,19 @@ class Model():
 
         z, self.mu, self.sigma = self.encoder(batch, hyper.batch_size)
 
-        sos = Variable(torch.stack([torch.Tensor([0, 0, 1, 0, 0])] * hp.batch_size).cuda()).unsqueeze(0)
+        sos = Variable(torch.stack([torch.Tensor([0, 0, 1, 0, 0])] * hyper.batch_size).cuda()).unsqueeze(0)
         batch_init = torch.cat([sos, batch], 0)
         z_stack = torch.stack([z] * (sketches.Nmax + 1))
         inputs = torch.cat([batch_init, z_stack], 2)
 
-        self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, self.rho_xy, self.q = self.decoder(inputs, z)
+        self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, self.rho_xy, self.q, _, _ = self.decoder(inputs, z)
 
         mask, dx, dy, p = sketches.get_target(batch,lengths)
 
         self.encoder_optim.zero_grad()
         self.decoder_optim.zero_grad()
 
-        self.eta_step = 1 - (1 - hp.eta_min) * hp.R
+        self.eta_step = 1 - (1 - hyper.eta_min) * hyper.R
 
         LKL = self.kullback_leibler_loss()
         LR = self.reconstruction_loss(mask, dx, dy, p, epoch)
@@ -191,19 +196,30 @@ class Model():
 
         loss.backward()
 
-        nn.utils.clip_grad_norm(self.encoder.parameters(), hp.grad_clip)
-        nn.utils.clip_grad_norm(self.decoder.parameters(), hp.grad_clip)
+        nn.utils.clip_grad_norm(self.encoder.parameters(), hyper.grad_clip)
+        nn.utils.clip_grad_norm(self.decoder.parameters(), hyper.grad_clip)
 
         self.encoder_optim.step()
         self.decoder_optim.step()
 
         if epoch%1000 == 0:
-            self.encoder_optim = lr_decay(self.encoder_optim)
-            self.decoder_optim = lr_decay(self.decoder_optim)
+            self.encoder_optim = self.lr_decay(self.encoder_optim)
+            self.decoder_optim = self.lr_decay(self.decoder_optim)
 
         # todo save
+
         # todo load
+
         # todo conditional generation
+        # This uses z from a trained model encoder, but feeds a sample image into the decoder
+        # Using the input, the model "reconstructs" the image
+        # Thus, not deterministic, but random
+        # Temperature parameter controls randomness
+
+        # todo unconditional generation
+        # hidden/cell are initialized to zero and no z vector is used
+        # encoder is _not_ trained
+        # Can sample images and vary temp to get more varied output
 
 
     def lr_decay(self, optimizer):
@@ -224,12 +240,12 @@ class Model():
 
     def reconstruction_loss(self, mask, dx, dy, p, epoch):
         pdf = self.bivariate_normal_pdf(dx, dy)
-        LS = -torch.sum(mask * torch.log(1e-5 + torch.sum(self.pi * pdf, 2))) / float(sketches.Nmax * hp.batch_size)
-        LP = -torch.sum(p * torch.log(self.q)) / float(sketches.Nmax * hp.batch_size)
+        LS = -torch.sum(mask * torch.log(1e-5 + torch.sum(self.pi * pdf, 2))) / float(sketches.Nmax * hyper.batch_size)
+        LP = -torch.sum(p * torch.log(self.q)) / float(sketches.Nmax * hyper.batch_size)
         return LS + LP
 
     def kullback_leibler_loss(self):
-        LKL = -0.5 * torch.sum(1 + self.sigma - self.mu ** 2 - torch.exp(self.sigma))/ float(hp.Nz * hp.batch_size)
+        LKL = -0.5 * torch.sum(1 + self.sigma - self.mu ** 2 - torch.exp(self.sigma))/ float(hyper.Nz * hyper.batch_size)
         KL_min = Variable(torch.Tensor([hyper.KL_min]).cuda()).detach()
         return hyper.wKL * self.eta_step * torch.max(LKL, KL_min)
 
